@@ -3,59 +3,43 @@ from __future__ import annotations
 import argparse
 import datetime
 import heapq
-import os
-import time
-from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Dict, Optional, Union, cast
 
 import pandas as pd
 from traffic.algorithms.prediction.flightplan import FlightPlanPredict
 from traffic.core import Flight, FlightPlan, Traffic
-from traffic.core.mixins import DataFrameMixin
-
-extent = "LFBBBDX"
-prefix_sector = "LFBB"
 
 
-def basename(fname: str) -> str:
-    return os.path.splitext(os.path.basename(fname))[0]
+def _normalize_route(route: str) -> str:
+    """
+    If route begins with `XXX DCT ...`, drop the 'DCT' token.
+    """
+    fpg = route.split()
+    if len(fpg) >= 2 and fpg[1] == "DCT":
+        return " ".join([fpg[0], *fpg[2:]])
+    return route
 
 
-def default(defaultfname: str, fname: Optional[str]) -> str:
-    return defaultfname if fname is None else fname
-
-
-class Metadata(DataFrameMixin):
-    def __getitem__(self, key: str) -> None | FlightPlan:
-        df = self.data.query(f'flight_id == "{key}"')
-        if df.shape[0] == 0:
-            return None
-
-        fps = df.iloc[0]['route']
-        fpg = fps.split()
-        return FlightPlan(" ".join([fpg[0], *fpg[2:]]) if fpg[1] == "DCT" else fps)
-
-
-
-metadata = pd.read_parquet("/home/kim/kimthesis/scripts/download_data/A22_metadata")
-
-metadata_simple = Metadata(
-    metadata.groupby("flight_id", as_index=False)
-    .last()
-    .eval("icao24 = icao24.str.lower()")
-)
-
-
-def dist_lat_min(f1: Flight, f2: Flight) -> Any:
-    try:
-        if f1 & f2 is None:  # no overlap
-            return None
-        return cast(pd.DataFrame, f1.distance(f2))["lateral"].min()
-    except TypeError:
-        print(
-            f"exception in dist_lat_min for flights {f1.flight_id} and {f2.flight_id}"
-        )
+def _route_to_flightplan(value: Union[str, FlightPlan]) -> Optional[FlightPlan]:
+    if value is None:
         return None
+    if isinstance(value, FlightPlan):
+        return value
+    if isinstance(value, str):
+        return FlightPlan(_normalize_route(value))
+    raise TypeError(f"Unsupported flightplan type: {type(value)}")
+
+
+# def dist_lat_min(f1: Flight, f2: Flight) -> Any:
+#     try:
+#         if f1 & f2 is None:  # no overlap
+#             return None
+#         return cast(pd.DataFrame, f1.distance(f2))["lateral"].min()
+#     except TypeError:
+#         print(
+#             f"exception in dist_lat_min for flights {f1.flight_id} and {f2.flight_id}"
+#         )
+#         return None
 
 
 def extract_flight_deviations(
@@ -81,7 +65,6 @@ def extract_flight_deviations(
 
     :return: None or DataFrame containing selected deviations
     """
-    cast(str, flight.flight_id)
     list_dicts = []
 
     for hole in flight - flight.aligned_on_navpoint(
@@ -122,20 +105,26 @@ def extract_flight_deviations(
 
             # we select neighbours which altitude intersects flight
             # find intersecting portions
-            neighbours = (
+            neighbours_candidate = (
                 cast(Traffic, context_traffic - flight)
                 .between(
                     start=hole.start,
                     stop=stop_neighbours,
                     strict=False,
                 )
-                .iterate_lazy()
-                .query(
-                    f"{altmin_neighbours} <= altitude <= {altmax_neighbours}"
-                )
-                .feature_gt("duration", datetime.timedelta(seconds=2))
-                .eval()
             )
+            if neighbours_candidate is not None:
+                neighbours = (
+                    neighbours_candidate
+                    .iterate_lazy()
+                    .query(
+                        f"{altmin_neighbours} <= altitude <= {altmax_neighbours}"
+                    )
+                    .feature_gt("duration", datetime.timedelta(seconds=2))
+                    .eval()
+                )
+            else:
+                neighbours = None
 
             pred_possible = flight.before(hole.start) is not None
 
@@ -147,7 +136,10 @@ def extract_flight_deviations(
                 predictor = FlightPlanPredict(fp=flightplan, 
                                               start=hole.start, 
                                               horizon_minutes=20)
-                pred_fp = predictor.predict(flight).convert_dtypes(dtype_backend="pyarrow")
+                pred_fp = (
+                    predictor.predict(flight)
+                    .convert_dtypes(dtype_backend="pyarrow")
+                )
 
 
             if neighbours is not None:
@@ -196,7 +188,10 @@ def extract_flight_deviations(
                         temp_dict["neighbour_id"] = n[1]
                         temp_dict["min_fp_time"] = n[2]
                         closest = neighbours[n[1]]
-                        temp_dict["alt_pred_cpa"] = pred_fp.at(n[2]).altitude
+                        pred_fp_pos = pred_fp.at(n[2])
+                        temp_dict["alt_pred_cpa"] = (
+                            pred_fp_pos.altitude if pred_fp_pos is not None else None
+                        )
                         temp_dict["alt_neighbour_cpa"] = closest.at(
                             n[2]
                         ).altitude
@@ -227,29 +222,33 @@ def extract_flight_deviations(
 
 def extract_traffic_deviations(
     flights: Traffic,
-    metadata_file: Path,
+    # metadata_file: Path,
+    flightplans: Dict[str, Union[str, FlightPlan]],
     context_traffic: Traffic,
     margin_fl: int = 50,
     angle_precision: int = 2,
     min_distance: int = 200,
     forward_time: int = 20,
 ) -> pd.DataFrame:
-    cumul_deviations = []
-    metadata = pd.read_parquet(metadata_file)
-
-    metadata_simple = Metadata(
-        metadata.groupby("flight_id", as_index=False)
-        .last()
-        .eval("icao24 = icao24.str.lower()")
-    )
-    # metadata_simple = metadata_simple[metadata_simple["state"] != "CANCELLED"]
+    cumul_deviations = []  
 
     for flight in flights:
         try:
+            fp_raw = flightplans.get(cast(str, flight.flight_id))
+            if fp_raw is None:
+                print(f"No flightplan found for flight {flight.flight_id}")
+                continue
+            fp = _route_to_flightplan(fp_raw)
+            if fp is None:
+                continue
             df = extract_flight_deviations(
                 flight,
-                cast(FlightPlan, metadata_simple[cast(str, flight.flight_id)]),
+                fp,
                 context_traffic,
+                margin_fl=margin_fl,
+                angle_precision=angle_precision,
+                min_distance=min_distance,
+                forward_time=forward_time,
             )
             if df is not None:
                 cumul_deviations.append(df)
@@ -269,25 +268,60 @@ def extract_traffic_deviations(
     return all_deviations
 
 
+def _load_fp_dict(fp_path: str) -> Dict[str, Union[str, FlightPlan]]:
+    # Load CSV or Parquet containing columns: flight_id, route
+    if fp_path.endswith(".parquet"):
+        df = pd.read_parquet(fp_path)
+    else:
+        df = pd.read_csv(fp_path)
+
+    # keep last route per flight_id 
+    if "flight_id" not in df or "route" not in df:
+        raise ValueError(
+            "Flightplan file must contain columns: 'flight_id' and 'route'."
+            )
+
+    df_last = df.groupby("flight_id", as_index=False).last()[["flight_id", "route"]]
+    return df_last.set_index("flight_id")["route"].to_dict()
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract deviations from dataframe",
-    )
-    parser.add_argument("-trajs")
-    parser.add_argument("-out", default=None)
+        description="Extract deviations from trajectory data"
+        )
+    parser.add_argument(
+        "--trajs", required=True, help="Path to trajectories file (Traffic.from_file)"
+        )
+    parser.add_argument(
+        "--fp", required=True, help="CSV or Parquet with columns: flight_id, route"
+        )
+    parser.add_argument("--out", required=True, help="Output parquet for deviations")
+    parser.add_argument("--margin-fl", type=int, default=50)
+    parser.add_argument("--angle-precision", type=int, default=2)
+    parser.add_argument("--min-distance", type=int, default=200)
+    parser.add_argument(
+        "--forward-time", type=int, default=20, help="Prediction horizon (minutes)"
+        )
     args = parser.parse_args()
+
+    # Load trajectories
     trajs = Traffic.from_file(args.trajs)
     trajs.data = trajs.data.dropna()
 
-    time.time()
+    # Build {flight_id: route}
+    fp_dict = _load_fp_dict(args.fp)
+
+    # Use trajs as both flights of interest and context traffic
     deviations = extract_traffic_deviations(
         cast(Traffic, trajs),
-        Path("../download_data/A22_metadata"),
+        fp_dict,
         cast(Traffic, trajs),
+        margin_fl=args.margin_fl,
+        angle_precision=args.angle_precision,
+        min_distance=args.min_distance,
+        forward_time=args.forward_time,
     )
 
-    out = args.out
-    deviations.to_parquet(out)
+    deviations.to_parquet(args.out)
 
 
 if __name__ == "__main__":
