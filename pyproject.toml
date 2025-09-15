@@ -1,0 +1,31 @@
+# pyproject.toml
+
+
+
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flight-deviations"            # distribution name on PyPI
+version = "0.1.0"
+description = "Utilities to detect and analyze flight path deviations"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "license.md" }
+authors = [{ name = "Kim", email = "kim.gaume@gmail.com" }]
+dependencies = [
+  "pandas>=1.5",
+  # "numpy>=1.23",
+  # "traffic>=2.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flight_deviations"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/extract_deviations",
+  "README.md",
+  "license.md",
+]
